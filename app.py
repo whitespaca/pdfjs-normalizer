@@ -1,0 +1,396 @@
+import concurrent.futures as futures
+import os
+import queue
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import fitz  # PyMuPDF
+
+
+APP_TITLE = "PDF.js 호환 PDF 일괄 변환기"
+APP_VERSION = "1.0.0"
+
+
+@dataclass(frozen=True)
+class ConvertOptions:
+    input_dir: Path
+    output_dir: Path
+    dpi: int
+    image_format: str
+    jpeg_quality: int
+    workers: int
+    skip_existing: bool
+    suffix: str
+
+
+@dataclass(frozen=True)
+class ConvertResult:
+    status: str
+    source: str
+    output: str
+    message: str = ""
+    elapsed_sec: float = 0.0
+
+
+def iter_pdfs(input_dir: Path) -> list[Path]:
+    return sorted(
+        p for p in input_dir.rglob("*.pdf")
+        if p.is_file() and not p.name.startswith("~$")
+    )
+
+
+def output_path_for(src: Path, options: ConvertOptions) -> Path:
+    rel = src.relative_to(options.input_dir)
+    if options.suffix.strip():
+        rel = rel.with_name(f"{rel.stem}{options.suffix}{rel.suffix}")
+    return options.output_dir / rel
+
+
+def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Event) -> ConvertResult:
+    started = time.perf_counter()
+    dst = output_path_for(src, options)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+
+    if options.skip_existing and dst.exists() and dst.stat().st_size > 0:
+        return ConvertResult("skip", str(src), str(dst), "already exists", time.perf_counter() - started)
+
+    try:
+        if cancel_event.is_set():
+            return ConvertResult("cancel", str(src), str(dst), "cancel requested", time.perf_counter() - started)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        src_doc = fitz.open(src)
+        if src_doc.needs_pass:
+            src_doc.close()
+            return ConvertResult("fail", str(src), str(dst), "encrypted/password protected", time.perf_counter() - started)
+
+        out_doc = fitz.open()
+        matrix = fitz.Matrix(options.dpi / 72.0, options.dpi / 72.0)
+
+        for page_index in range(src_doc.page_count):
+            if cancel_event.is_set():
+                out_doc.close()
+                src_doc.close()
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                return ConvertResult("cancel", str(src), str(dst), "cancel requested", time.perf_counter() - started)
+
+            page = src_doc.load_page(page_index)
+            page_rect = page.rect
+            pix = page.get_pixmap(matrix=matrix, alpha=False, annots=True)
+
+            if options.image_format == "jpeg":
+                image_bytes = pix.tobytes("jpeg", jpg_quality=options.jpeg_quality)
+            else:
+                image_bytes = pix.tobytes("png")
+
+            new_page = out_doc.new_page(width=page_rect.width, height=page_rect.height)
+            new_page.insert_image(page_rect, stream=image_bytes)
+
+        out_doc.save(
+            tmp,
+            garbage=4,
+            deflate=True,
+            clean=True,
+        )
+        out_doc.close()
+        src_doc.close()
+
+        os.replace(tmp, dst)
+        return ConvertResult("ok", str(src), str(dst), "converted", time.perf_counter() - started)
+
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return ConvertResult("fail", str(src), str(dst), traceback.format_exc(), time.perf_counter() - started)
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(f"{APP_TITLE} v{APP_VERSION}")
+        self.geometry("980x680")
+        self.minsize(860, 560)
+
+        self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker_thread: threading.Thread | None = None
+        self.total_count = 0
+        self.done_count = 0
+        self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
+
+        self.input_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+        self.dpi_var = tk.IntVar(value=200)
+        self.format_var = tk.StringVar(value="png")
+        self.quality_var = tk.IntVar(value=95)
+        self.workers_var = tk.IntVar(value=min(4, max(1, os.cpu_count() or 1)))
+        self.skip_var = tk.BooleanVar(value=True)
+        self.suffix_var = tk.StringVar(value="-pdfjs")
+        self.status_var = tk.StringVar(value="대기 중")
+
+        self._build_ui()
+        self.after(120, self._poll_queue)
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.LabelFrame(outer, text="입출력", padding=12)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="원본 PDF 폴더").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=5)
+        ttk.Entry(top, textvariable=self.input_var).grid(row=0, column=1, sticky=tk.EW, pady=5)
+        ttk.Button(top, text="선택", command=self.choose_input).grid(row=0, column=2, padx=(8, 0), pady=5)
+
+        ttk.Label(top, text="변환본 저장 폴더").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=5)
+        ttk.Entry(top, textvariable=self.output_var).grid(row=1, column=1, sticky=tk.EW, pady=5)
+        ttk.Button(top, text="선택", command=self.choose_output).grid(row=1, column=2, padx=(8, 0), pady=5)
+        top.columnconfigure(1, weight=1)
+
+        options = ttk.LabelFrame(outer, text="변환 옵션", padding=12)
+        options.pack(fill=tk.X, pady=(12, 0))
+
+        ttk.Label(options, text="DPI").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=5)
+        ttk.Spinbox(options, from_=120, to=400, increment=10, textvariable=self.dpi_var, width=8).grid(row=0, column=1, sticky=tk.W, pady=5)
+
+        ttk.Label(options, text="이미지 형식").grid(row=0, column=2, sticky=tk.W, padx=(24, 8), pady=5)
+        fmt = ttk.Combobox(options, values=["png", "jpeg"], textvariable=self.format_var, state="readonly", width=8)
+        fmt.grid(row=0, column=3, sticky=tk.W, pady=5)
+        fmt.bind("<<ComboboxSelected>>", lambda _e: self._sync_quality_state())
+
+        ttk.Label(options, text="JPEG 품질").grid(row=0, column=4, sticky=tk.W, padx=(24, 8), pady=5)
+        self.quality_spin = ttk.Spinbox(options, from_=50, to=100, increment=1, textvariable=self.quality_var, width=8)
+        self.quality_spin.grid(row=0, column=5, sticky=tk.W, pady=5)
+
+        ttk.Label(options, text="동시 작업 수").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=5)
+        ttk.Spinbox(options, from_=1, to=max(1, (os.cpu_count() or 4) * 2), increment=1, textvariable=self.workers_var, width=8).grid(row=1, column=1, sticky=tk.W, pady=5)
+
+        ttk.Label(options, text="파일명 접미사").grid(row=1, column=2, sticky=tk.W, padx=(24, 8), pady=5)
+        ttk.Entry(options, textvariable=self.suffix_var, width=16).grid(row=1, column=3, sticky=tk.W, pady=5)
+
+        ttk.Checkbutton(options, text="이미 존재하는 변환본은 건너뛰기", variable=self.skip_var).grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=(24, 0), pady=5)
+        self._sync_quality_state()
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill=tk.X, pady=(12, 0))
+
+        self.start_button = ttk.Button(actions, text="변환 시작", command=self.start)
+        self.start_button.pack(side=tk.LEFT)
+        self.cancel_button = ttk.Button(actions, text="취소", command=self.cancel, state=tk.DISABLED)
+        self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(actions, textvariable=self.status_var).pack(side=tk.LEFT, padx=(18, 0))
+
+        self.progress = ttk.Progressbar(outer, orient=tk.HORIZONTAL, mode="determinate")
+        self.progress.pack(fill=tk.X, pady=(12, 0))
+
+        log_frame = ttk.LabelFrame(outer, text="로그", padding=8)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+
+        self.log_text = tk.Text(log_frame, wrap=tk.NONE, height=18)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=yscroll.set)
+
+        self._log("PDF.js에서 불안정한 PDF를 페이지 이미지 기반 PDF로 정규화합니다.")
+        self._log("권장 시작값: DPI 200, PNG. 파일 크기가 크면 JPEG 95를 테스트하세요.")
+
+    def _sync_quality_state(self) -> None:
+        if self.format_var.get() == "jpeg":
+            self.quality_spin.configure(state="normal")
+        else:
+            self.quality_spin.configure(state="disabled")
+
+    def choose_input(self) -> None:
+        path = filedialog.askdirectory(title="원본 PDF 폴더 선택")
+        if path:
+            self.input_var.set(path)
+            if not self.output_var.get():
+                self.output_var.set(str(Path(path).with_name(Path(path).name + "-pdfjs-compatible")))
+
+    def choose_output(self) -> None:
+        path = filedialog.askdirectory(title="변환본 저장 폴더 선택")
+        if path:
+            self.output_var.set(path)
+
+    def _validate_options(self) -> ConvertOptions | None:
+        input_dir = Path(self.input_var.get()).expanduser().resolve()
+        output_dir = Path(self.output_var.get()).expanduser().resolve()
+
+        if not input_dir.exists() or not input_dir.is_dir():
+            messagebox.showerror("입력 오류", "원본 PDF 폴더를 올바르게 선택하세요.")
+            return None
+        if input_dir == output_dir:
+            messagebox.showerror("입력 오류", "원본 폴더와 출력 폴더는 달라야 합니다.")
+            return None
+
+        try:
+            dpi = int(self.dpi_var.get())
+            jpeg_quality = int(self.quality_var.get())
+            workers = int(self.workers_var.get())
+        except Exception:
+            messagebox.showerror("입력 오류", "DPI, JPEG 품질, 동시 작업 수는 숫자여야 합니다.")
+            return None
+
+        if dpi < 120 or dpi > 400:
+            messagebox.showerror("입력 오류", "DPI는 120~400 범위로 지정하세요.")
+            return None
+        if jpeg_quality < 50 or jpeg_quality > 100:
+            messagebox.showerror("입력 오류", "JPEG 품질은 50~100 범위로 지정하세요.")
+            return None
+        if workers < 1:
+            messagebox.showerror("입력 오류", "동시 작업 수는 1 이상이어야 합니다.")
+            return None
+
+        return ConvertOptions(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            dpi=dpi,
+            image_format=self.format_var.get(),
+            jpeg_quality=jpeg_quality,
+            workers=workers,
+            skip_existing=bool(self.skip_var.get()),
+            suffix=self.suffix_var.get(),
+        )
+
+    def start(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+
+        options = self._validate_options()
+        if options is None:
+            return
+
+        pdfs = iter_pdfs(options.input_dir)
+        if not pdfs:
+            messagebox.showinfo("PDF 없음", "선택한 폴더에 PDF 파일이 없습니다.")
+            return
+
+        self.cancel_event.clear()
+        self.total_count = len(pdfs)
+        self.done_count = 0
+        self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
+        self.progress.configure(maximum=self.total_count, value=0)
+        self.start_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.NORMAL)
+        self.status_var.set(f"0 / {self.total_count} 처리 중")
+        self._log("-" * 90)
+        self._log(f"대상 PDF: {self.total_count}개")
+        self._log(f"입력: {options.input_dir}")
+        self._log(f"출력: {options.output_dir}")
+        self._log(f"옵션: DPI={options.dpi}, format={options.image_format}, quality={options.jpeg_quality}, workers={options.workers}")
+
+        self.worker_thread = threading.Thread(
+            target=self._worker_main,
+            args=(pdfs, options),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.status_var.set("취소 요청됨: 진행 중인 파일 완료 후 중단")
+        self._log("취소 요청됨")
+
+    def _worker_main(self, pdfs: list[Path], options: ConvertOptions) -> None:
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = options.output_dir / "_conversion-log.tsv"
+
+        with log_path.open("w", encoding="utf-8") as log_file:
+            log_file.write("status\tsource\toutput\telapsed_sec\tmessage\n")
+            log_file.flush()
+
+            try:
+                with futures.ThreadPoolExecutor(max_workers=options.workers) as executor:
+                    future_map = {}
+                    for src in pdfs:
+                        if self.cancel_event.is_set():
+                            break
+                        fut = executor.submit(convert_pdf, src, options, self.cancel_event)
+                        future_map[fut] = src
+
+                    for fut in futures.as_completed(future_map):
+                        result = fut.result()
+                        safe_msg = result.message.replace("\r", " ").replace("\n", " | ")
+                        log_file.write(f"{result.status}\t{result.source}\t{result.output}\t{result.elapsed_sec:.2f}\t{safe_msg}\n")
+                        log_file.flush()
+                        self.event_queue.put(("result", result))
+
+                        if self.cancel_event.is_set():
+                            # 이미 제출된 작업은 계속 완료될 수 있다.
+                            pass
+            except Exception:
+                self.event_queue.put(("fatal", traceback.format_exc()))
+            finally:
+                self.event_queue.put(("done", str(log_path)))
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                event, payload = self.event_queue.get_nowait()
+                if event == "result":
+                    self._handle_result(payload)  # type: ignore[arg-type]
+                elif event == "fatal":
+                    self._log("치명적 오류:\n" + str(payload))
+                elif event == "done":
+                    self._finish(str(payload))
+        except queue.Empty:
+            pass
+        self.after(120, self._poll_queue)
+
+    def _handle_result(self, result: ConvertResult) -> None:
+        self.done_count += 1
+        self.counts[result.status] = self.counts.get(result.status, 0) + 1
+        self.progress.configure(value=self.done_count)
+
+        name = Path(result.source).name
+        if result.status == "ok":
+            self._log(f"[OK] {name} -> {result.output} ({result.elapsed_sec:.1f}s)")
+        elif result.status == "skip":
+            self._log(f"[SKIP] {name}")
+        elif result.status == "cancel":
+            self._log(f"[CANCEL] {name}")
+        else:
+            self._log(f"[FAIL] {name}\n{result.message}")
+
+        self.status_var.set(
+            f"{self.done_count} / {self.total_count} | "
+            f"성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, 실패 {self.counts.get('fail', 0)}"
+        )
+
+    def _finish(self, log_path: str) -> None:
+        self.start_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.status_var.set(
+            f"완료 | 성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, "
+            f"실패 {self.counts.get('fail', 0)}, 취소 {self.counts.get('cancel', 0)}"
+        )
+        self._log(f"로그 파일: {log_path}")
+        self._log("완료")
+
+    def _log(self, text: str) -> None:
+        self.log_text.insert(tk.END, text + "\n")
+        self.log_text.see(tk.END)
+
+
+def main() -> None:
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
