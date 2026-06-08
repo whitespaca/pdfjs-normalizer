@@ -1,90 +1,90 @@
-# PDF.js 호환 PDF 일괄 변환기
+# PDFjsNormalizerGUI
 
-PDF.js에서 워터마크만 보이거나 페이지가 비어 보이는 이미지 기반 PDF를 웹 임베딩용으로 정규화하는 Windows GUI 앱입니다.
+PDF.js에서 일부 PDF가 워터마크만 보이거나 빈 페이지로 보이는 문제를 줄이기 위한 Windows GUI 배치 변환기입니다.
 
-## 동작 방식
+이 도구는 PDF 페이지를 이미지로 렌더링한 뒤 새 PDF로 재생성합니다. JBIG2 등 PDF.js에서 불안정할 수 있는 내부 이미지 인코딩을 우회하는 목적입니다.
 
-각 PDF 페이지를 지정 DPI로 렌더링한 뒤, 그 이미지를 새 PDF 페이지에 삽입합니다.
+## 주요 기능
 
-- JBIG2 등 PDF.js 호환성 문제가 있는 내부 이미지 필터 제거
-- PDF JavaScript / OpenAction / 첨부파일 / 폼 같은 동적 요소 제거
-- 원본 폴더 구조 유지
-- 기존 변환본 건너뛰기 가능
-- 변환 로그 TSV 생성
+- 폴더 단위 PDF 일괄 변환
+- 하위 폴더 구조 유지
+- DPI 설정
+- PNG / JPEG 선택
+- JPEG 품질 설정
+- 동시 작업 수 설정
+- 기존 변환본 건너뛰기
+- 변환 취소
+- 변환 로그 저장
+- 권한 있는 문서 전용: 명시적 PDF 워터마크 Artifact 제거 후 변환
+
+## 워터마크 제거 옵션
+
+`명시적 PDF 워터마크 Artifact 제거 후 변환` 옵션은 다음과 같이 PDF 내부에 별도 marked-content block으로 표시된 워터마크만 제거합니다.
+
+```text
+/Artifact <</Subtype /Watermark /Type /Pagination >>BDC
+...
+EMC
+```
+
+즉, 이미지에 이미 합쳐진 워터마크나 페이지 하단의 저작권 문구는 제거하지 않습니다. 권한이 있는 PDF에만 사용하세요.
 
 ## 권장 설정
 
-| 용도 | DPI | 이미지 형식 |
-|---|---:|---|
-| 웹 임베딩 기본 | 200 | PNG |
-| 파일 크기 절감 | 180~200 | JPEG 95 |
-| 악보 가독성 우선 | 220 | PNG 또는 JPEG 95 |
-| 인쇄 품질 우선 | 300 | PNG |
-
-대량 변환 전에는 20~30개 샘플로 DPI와 파일 크기를 비교하세요.
-
-## 개발 환경 실행
-
-```bat
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
-```
-
-## Windows EXE 빌드
-
-1. Windows PC에 Python 3.11 이상 설치
-2. 이 폴더에서 `build_windows.bat` 실행
-3. 결과물 확인
+### i7-12700F / RAM 32GB 기준
 
 ```text
-dist\PDFjsNormalizerGUI.exe
+DPI: 200
+이미지 형식: PNG
+동시 작업 수: 6
 ```
 
-## 사용 순서
-
-1. `원본 PDF 폴더` 선택
-2. `변환본 저장 폴더` 선택
-3. DPI / 이미지 형식 / 동시 작업 수 설정
-4. `변환 시작`
-5. 웹사이트에는 변환본 PDF만 임베딩
-
-## 출력 파일명
-
-기본값은 원본 파일명 뒤에 `-pdfjs`를 붙입니다.
-
-예시:
+속도와 용량을 우선하면:
 
 ```text
-109-파일.pdf
-109-파일-pdfjs.pdf
+DPI: 200
+이미지 형식: JPEG
+JPEG 품질: 95
+동시 작업 수: 8
 ```
 
-접미사를 비우면 원본과 같은 파일명으로 출력 폴더에 저장됩니다.
-
-## 주의사항
-
-- 출력 폴더를 원본 폴더와 동일하게 지정하지 마세요.
-- 전체 페이지를 이미지화하므로 텍스트 선택/검색은 유지되지 않습니다.
-- 악보 PDF 등 본문이 원래 이미지 기반인 경우에는 실질 손실이 작습니다.
-- PNG는 품질이 안정적이지만 파일이 커질 수 있습니다.
-- JPEG는 파일 크기가 작아질 수 있지만 아주 미세한 압축 흔적이 생길 수 있습니다.
-
-
-## Windows build troubleshooting
-
-If `build_windows.bat` shows broken Korean text or commands such as `evel`, `m venv`, or `clean --onefile`, use this fixed package. The batch file is ASCII-only and uses Windows CRLF line endings.
-
-Recommended command:
+## Windows에서 EXE 빌드
 
 ```bat
 build_windows.bat
 ```
 
-PowerShell alternative:
+결과물:
+
+```text
+dist\PDFjsNormalizerGUI.exe
+```
+
+PowerShell 대체 방식:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\build_windows.ps1
+```
+
+## GitHub Release 배포
+
+저장소에 업로드 후 태그를 푸시하면 GitHub Actions가 Windows EXE를 빌드하고 Release에 첨부합니다.
+
+```bat
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+Release 첨부 파일:
+
+```text
+PDFjsNormalizerGUI.exe
+SHA256SUMS.txt
+```
+
+수동 실행도 가능합니다.
+
+```text
+Repository -> Actions -> Build Windows EXE Release -> Run workflow
 ```

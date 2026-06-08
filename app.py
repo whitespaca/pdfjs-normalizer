@@ -1,12 +1,12 @@
 import concurrent.futures as futures
 import os
 import queue
+import re
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -15,7 +15,15 @@ import fitz  # PyMuPDF
 
 
 APP_TITLE = "PDF.js 호환 PDF 일괄 변환기"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
+
+# Removes marked-content blocks like:
+# /Artifact <</Subtype /Watermark /Type /Pagination >>BDC ... EMC
+# This intentionally targets explicit PDF watermark artifacts only.
+WATERMARK_ARTIFACT_RE = re.compile(
+    rb"/Artifact\s*<<(?:(?!>>).)*(?:/Subtype\s*/Watermark|/Type\s*/Pagination)(?:(?!>>).)*>>\s*BDC\s*.*?\s*EMC\s*",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,7 @@ class ConvertOptions:
     workers: int
     skip_existing: bool
     suffix: str
+    remove_watermark_artifacts: bool
 
 
 @dataclass(frozen=True)
@@ -37,6 +46,7 @@ class ConvertResult:
     output: str
     message: str = ""
     elapsed_sec: float = 0.0
+    watermark_blocks_removed: int = 0
 
 
 def iter_pdfs(input_dir: Path) -> list[Path]:
@@ -53,10 +63,43 @@ def output_path_for(src: Path, options: ConvertOptions) -> Path:
     return options.output_dir / rel
 
 
+def strip_watermark_artifacts(doc: fitz.Document) -> int:
+    """Remove explicit /Artifact Watermark marked-content blocks from page streams.
+
+    This does not edit the source file on disk. The opened document is modified in
+    memory before rasterization. It is deliberately conservative and only removes
+    content blocks marked as /Subtype /Watermark or /Type /Pagination.
+    """
+    total_removed = 0
+    updated_streams: set[int] = set()
+
+    for page in doc:
+        for content_xref in page.get_contents():
+            if content_xref in updated_streams:
+                continue
+
+            try:
+                data = doc.xref_stream(content_xref)
+            except Exception:
+                continue
+
+            if not data:
+                continue
+
+            new_data, removed = WATERMARK_ARTIFACT_RE.subn(b"", data)
+            if removed:
+                doc.update_stream(content_xref, new_data)
+                updated_streams.add(content_xref)
+                total_removed += removed
+
+    return total_removed
+
+
 def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Event) -> ConvertResult:
     started = time.perf_counter()
     dst = output_path_for(src, options)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
+    watermark_blocks_removed = 0
 
     if options.skip_existing and dst.exists() and dst.stat().st_size > 0:
         return ConvertResult("skip", str(src), str(dst), "already exists", time.perf_counter() - started)
@@ -72,6 +115,9 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
             src_doc.close()
             return ConvertResult("fail", str(src), str(dst), "encrypted/password protected", time.perf_counter() - started)
 
+        if options.remove_watermark_artifacts:
+            watermark_blocks_removed = strip_watermark_artifacts(src_doc)
+
         out_doc = fitz.open()
         matrix = fitz.Matrix(options.dpi / 72.0, options.dpi / 72.0)
 
@@ -81,7 +127,14 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
                 src_doc.close()
                 if tmp.exists():
                     tmp.unlink(missing_ok=True)
-                return ConvertResult("cancel", str(src), str(dst), "cancel requested", time.perf_counter() - started)
+                return ConvertResult(
+                    "cancel",
+                    str(src),
+                    str(dst),
+                    "cancel requested",
+                    time.perf_counter() - started,
+                    watermark_blocks_removed,
+                )
 
             page = src_doc.load_page(page_index)
             page_rect = page.rect
@@ -105,7 +158,10 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
         src_doc.close()
 
         os.replace(tmp, dst)
-        return ConvertResult("ok", str(src), str(dst), "converted", time.perf_counter() - started)
+        message = "converted"
+        if options.remove_watermark_artifacts:
+            message += f"; watermark artifact blocks removed={watermark_blocks_removed}"
+        return ConvertResult("ok", str(src), str(dst), message, time.perf_counter() - started, watermark_blocks_removed)
 
     except Exception:
         try:
@@ -113,15 +169,15 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
                 tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        return ConvertResult("fail", str(src), str(dst), traceback.format_exc(), time.perf_counter() - started)
+        return ConvertResult("fail", str(src), str(dst), traceback.format_exc(), time.perf_counter() - started, watermark_blocks_removed)
 
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.geometry("980x680")
-        self.minsize(860, 560)
+        self.geometry("1020x720")
+        self.minsize(900, 600)
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
@@ -129,15 +185,17 @@ class App(tk.Tk):
         self.total_count = 0
         self.done_count = 0
         self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
+        self.watermark_blocks_total = 0
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.dpi_var = tk.IntVar(value=200)
         self.format_var = tk.StringVar(value="png")
         self.quality_var = tk.IntVar(value=95)
-        self.workers_var = tk.IntVar(value=min(4, max(1, os.cpu_count() or 1)))
+        self.workers_var = tk.IntVar(value=min(6, max(1, os.cpu_count() or 1)))
         self.skip_var = tk.BooleanVar(value=True)
         self.suffix_var = tk.StringVar(value="-pdfjs")
+        self.remove_watermark_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="대기 중")
 
         self._build_ui()
@@ -181,6 +239,19 @@ class App(tk.Tk):
         ttk.Entry(options, textvariable=self.suffix_var, width=16).grid(row=1, column=3, sticky=tk.W, pady=5)
 
         ttk.Checkbutton(options, text="이미 존재하는 변환본은 건너뛰기", variable=self.skip_var).grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=(24, 0), pady=5)
+
+        watermark_box = ttk.LabelFrame(outer, text="권한 있는 문서 전용 옵션", padding=12)
+        watermark_box.pack(fill=tk.X, pady=(12, 0))
+        ttk.Checkbutton(
+            watermark_box,
+            text="명시적 PDF 워터마크 Artifact 제거 후 변환",
+            variable=self.remove_watermark_var,
+        ).grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(
+            watermark_box,
+            text="/Artifact + /Subtype /Watermark 또는 /Type /Pagination으로 표시된 별도 워터마크 블록만 제거합니다. 이미지에 합쳐진 표기는 제거하지 않습니다.",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+
         self._sync_quality_state()
 
         actions = ttk.Frame(outer)
@@ -206,7 +277,8 @@ class App(tk.Tk):
         self.log_text.configure(yscrollcommand=yscroll.set)
 
         self._log("PDF.js에서 불안정한 PDF를 페이지 이미지 기반 PDF로 정규화합니다.")
-        self._log("권장 시작값: DPI 200, PNG. 파일 크기가 크면 JPEG 95를 테스트하세요.")
+        self._log("권장 시작값: DPI 200, PNG, workers 6. 파일 크기가 크면 JPEG 95를 테스트하세요.")
+        self._log("워터마크 제거 옵션은 권한이 있는 PDF에서만 사용하세요.")
 
     def _sync_quality_state(self) -> None:
         if self.format_var.get() == "jpeg":
@@ -264,6 +336,7 @@ class App(tk.Tk):
             workers=workers,
             skip_existing=bool(self.skip_var.get()),
             suffix=self.suffix_var.get(),
+            remove_watermark_artifacts=bool(self.remove_watermark_var.get()),
         )
 
     def start(self) -> None:
@@ -279,10 +352,19 @@ class App(tk.Tk):
             messagebox.showinfo("PDF 없음", "선택한 폴더에 PDF 파일이 없습니다.")
             return
 
+        if options.remove_watermark_artifacts:
+            ok = messagebox.askyesno(
+                "권한 확인",
+                "워터마크 Artifact 제거 옵션이 켜져 있습니다.\n\n이 옵션은 권한이 있는 PDF에서만 사용해야 합니다. 계속할까요?",
+            )
+            if not ok:
+                return
+
         self.cancel_event.clear()
         self.total_count = len(pdfs)
         self.done_count = 0
         self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
+        self.watermark_blocks_total = 0
         self.progress.configure(maximum=self.total_count, value=0)
         self.start_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(state=tk.NORMAL)
@@ -291,7 +373,10 @@ class App(tk.Tk):
         self._log(f"대상 PDF: {self.total_count}개")
         self._log(f"입력: {options.input_dir}")
         self._log(f"출력: {options.output_dir}")
-        self._log(f"옵션: DPI={options.dpi}, format={options.image_format}, quality={options.jpeg_quality}, workers={options.workers}")
+        self._log(
+            f"옵션: DPI={options.dpi}, format={options.image_format}, quality={options.jpeg_quality}, "
+            f"workers={options.workers}, remove_watermark_artifacts={options.remove_watermark_artifacts}"
+        )
 
         self.worker_thread = threading.Thread(
             target=self._worker_main,
@@ -311,7 +396,7 @@ class App(tk.Tk):
         log_path = options.output_dir / "_conversion-log.tsv"
 
         with log_path.open("w", encoding="utf-8") as log_file:
-            log_file.write("status\tsource\toutput\telapsed_sec\tmessage\n")
+            log_file.write("status\tsource\toutput\telapsed_sec\twatermark_blocks_removed\tmessage\n")
             log_file.flush()
 
             try:
@@ -326,12 +411,14 @@ class App(tk.Tk):
                     for fut in futures.as_completed(future_map):
                         result = fut.result()
                         safe_msg = result.message.replace("\r", " ").replace("\n", " | ")
-                        log_file.write(f"{result.status}\t{result.source}\t{result.output}\t{result.elapsed_sec:.2f}\t{safe_msg}\n")
+                        log_file.write(
+                            f"{result.status}\t{result.source}\t{result.output}\t{result.elapsed_sec:.2f}\t"
+                            f"{result.watermark_blocks_removed}\t{safe_msg}\n"
+                        )
                         log_file.flush()
                         self.event_queue.put(("result", result))
 
                         if self.cancel_event.is_set():
-                            # 이미 제출된 작업은 계속 완료될 수 있다.
                             pass
             except Exception:
                 self.event_queue.put(("fatal", traceback.format_exc()))
@@ -355,21 +442,27 @@ class App(tk.Tk):
     def _handle_result(self, result: ConvertResult) -> None:
         self.done_count += 1
         self.counts[result.status] = self.counts.get(result.status, 0) + 1
+        self.watermark_blocks_total += result.watermark_blocks_removed
         self.progress.configure(value=self.done_count)
 
         name = Path(result.source).name
+        wm_info = ""
+        if result.watermark_blocks_removed:
+            wm_info = f" | watermark blocks removed={result.watermark_blocks_removed}"
+
         if result.status == "ok":
-            self._log(f"[OK] {name} -> {result.output} ({result.elapsed_sec:.1f}s)")
+            self._log(f"[OK] {name} -> {result.output} ({result.elapsed_sec:.1f}s){wm_info}")
         elif result.status == "skip":
             self._log(f"[SKIP] {name}")
         elif result.status == "cancel":
-            self._log(f"[CANCEL] {name}")
+            self._log(f"[CANCEL] {name}{wm_info}")
         else:
-            self._log(f"[FAIL] {name}\n{result.message}")
+            self._log(f"[FAIL] {name}{wm_info}\n{result.message}")
 
         self.status_var.set(
             f"{self.done_count} / {self.total_count} | "
-            f"성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, 실패 {self.counts.get('fail', 0)}"
+            f"성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, 실패 {self.counts.get('fail', 0)}, "
+            f"워터마크 블록 제거 {self.watermark_blocks_total}"
         )
 
     def _finish(self, log_path: str) -> None:
@@ -377,7 +470,8 @@ class App(tk.Tk):
         self.cancel_button.configure(state=tk.DISABLED)
         self.status_var.set(
             f"완료 | 성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, "
-            f"실패 {self.counts.get('fail', 0)}, 취소 {self.counts.get('cancel', 0)}"
+            f"실패 {self.counts.get('fail', 0)}, 취소 {self.counts.get('cancel', 0)}, "
+            f"워터마크 블록 제거 {self.watermark_blocks_total}"
         )
         self._log(f"로그 파일: {log_path}")
         self._log("완료")
