@@ -1,4 +1,5 @@
 import concurrent.futures as futures
+import io
 import os
 import queue
 import re
@@ -12,10 +13,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import fitz  # PyMuPDF
+from PIL import Image
 
 
 APP_TITLE = "PDF.js 호환 PDF 일괄 변환기"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Removes marked-content blocks like:
 # /Artifact <</Subtype /Watermark /Type /Pagination >>BDC ... EMC
@@ -37,6 +39,8 @@ class ConvertOptions:
     skip_existing: bool
     suffix: str
     remove_watermark_artifacts: bool
+    raster_watermark_cleanup: bool
+    bw_threshold: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ class ConvertResult:
     message: str = ""
     elapsed_sec: float = 0.0
     watermark_blocks_removed: int = 0
+    raster_pages_cleaned: int = 0
 
 
 def iter_pdfs(input_dir: Path) -> list[Path]:
@@ -95,11 +100,52 @@ def strip_watermark_artifacts(doc: fitz.Document) -> int:
     return total_removed
 
 
+def pixmap_to_image_bytes(
+    pix: fitz.Pixmap,
+    image_format: str,
+    jpeg_quality: int,
+    raster_watermark_cleanup: bool,
+    bw_threshold: int,
+) -> tuple[bytes, bool]:
+    """Return page image bytes.
+
+    When raster_watermark_cleanup is enabled, the rendered page is converted to
+    black/white by thresholding. This removes light gray and colored watermarks
+    that have already been baked into the page bitmap. It is suitable for black
+    music-score pages on a white background; it can remove intentional light-gray
+    content.
+    """
+    if not raster_watermark_cleanup:
+        if image_format == "jpeg":
+            return pix.tobytes("jpeg", jpg_quality=jpeg_quality), False
+        return pix.tobytes("png"), False
+
+    mode = "RGBA" if pix.alpha else "RGB"
+    img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+    if mode == "RGBA":
+        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        white.alpha_composite(img)
+        img = white.convert("RGB")
+
+    gray = img.convert("L")
+    # Pixels darker than the threshold become black; everything else becomes white.
+    # Default 180 works well for MusicScore-like colored/gray overlay watermarks.
+    bw = gray.point(lambda value: 0 if value < bw_threshold else 255, mode="1")
+
+    buffer = io.BytesIO()
+    if image_format == "jpeg":
+        bw.convert("L").save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+    else:
+        bw.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue(), True
+
+
 def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Event) -> ConvertResult:
     started = time.perf_counter()
     dst = output_path_for(src, options)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     watermark_blocks_removed = 0
+    raster_pages_cleaned = 0
 
     if options.skip_existing and dst.exists() and dst.stat().st_size > 0:
         return ConvertResult("skip", str(src), str(dst), "already exists", time.perf_counter() - started)
@@ -134,16 +180,21 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
                     "cancel requested",
                     time.perf_counter() - started,
                     watermark_blocks_removed,
+                    raster_pages_cleaned,
                 )
 
             page = src_doc.load_page(page_index)
             page_rect = page.rect
             pix = page.get_pixmap(matrix=matrix, alpha=False, annots=True)
-
-            if options.image_format == "jpeg":
-                image_bytes = pix.tobytes("jpeg", jpg_quality=options.jpeg_quality)
-            else:
-                image_bytes = pix.tobytes("png")
+            image_bytes, cleaned = pixmap_to_image_bytes(
+                pix,
+                options.image_format,
+                options.jpeg_quality,
+                options.raster_watermark_cleanup,
+                options.bw_threshold,
+            )
+            if cleaned:
+                raster_pages_cleaned += 1
 
             new_page = out_doc.new_page(width=page_rect.width, height=page_rect.height)
             new_page.insert_image(page_rect, stream=image_bytes)
@@ -161,7 +212,17 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
         message = "converted"
         if options.remove_watermark_artifacts:
             message += f"; watermark artifact blocks removed={watermark_blocks_removed}"
-        return ConvertResult("ok", str(src), str(dst), message, time.perf_counter() - started, watermark_blocks_removed)
+        if options.raster_watermark_cleanup:
+            message += f"; raster pages cleaned={raster_pages_cleaned}; bw_threshold={options.bw_threshold}"
+        return ConvertResult(
+            "ok",
+            str(src),
+            str(dst),
+            message,
+            time.perf_counter() - started,
+            watermark_blocks_removed,
+            raster_pages_cleaned,
+        )
 
     except Exception:
         try:
@@ -169,15 +230,23 @@ def convert_pdf(src: Path, options: ConvertOptions, cancel_event: threading.Even
                 tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        return ConvertResult("fail", str(src), str(dst), traceback.format_exc(), time.perf_counter() - started, watermark_blocks_removed)
+        return ConvertResult(
+            "fail",
+            str(src),
+            str(dst),
+            traceback.format_exc(),
+            time.perf_counter() - started,
+            watermark_blocks_removed,
+            raster_pages_cleaned,
+        )
 
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.geometry("1020x720")
-        self.minsize(900, 600)
+        self.geometry("1040x760")
+        self.minsize(920, 650)
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
@@ -186,6 +255,7 @@ class App(tk.Tk):
         self.done_count = 0
         self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
         self.watermark_blocks_total = 0
+        self.raster_pages_cleaned_total = 0
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
@@ -196,6 +266,8 @@ class App(tk.Tk):
         self.skip_var = tk.BooleanVar(value=True)
         self.suffix_var = tk.StringVar(value="-pdfjs")
         self.remove_watermark_var = tk.BooleanVar(value=False)
+        self.raster_cleanup_var = tk.BooleanVar(value=False)
+        self.bw_threshold_var = tk.IntVar(value=180)
         self.status_var = tk.StringVar(value="대기 중")
 
         self._build_ui()
@@ -247,10 +319,25 @@ class App(tk.Tk):
             text="명시적 PDF 워터마크 Artifact 제거 후 변환",
             variable=self.remove_watermark_var,
         ).grid(row=0, column=0, sticky=tk.W, pady=2)
+
         ttk.Label(
             watermark_box,
-            text="/Artifact + /Subtype /Watermark 또는 /Type /Pagination으로 표시된 별도 워터마크 블록만 제거합니다. 이미지에 합쳐진 표기는 제거하지 않습니다.",
-        ).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+            text="/Artifact + /Subtype /Watermark 또는 /Type /Pagination으로 표시된 별도 워터마크 블록만 제거합니다.",
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(2, 8))
+
+        ttk.Checkbutton(
+            watermark_box,
+            text="이미지에 합쳐진 연한/컬러 워터마크 제거 시도: 흑백 임계값 변환",
+            variable=self.raster_cleanup_var,
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+
+        ttk.Label(watermark_box, text="임계값").grid(row=2, column=2, sticky=tk.W, padx=(24, 8))
+        ttk.Spinbox(watermark_box, from_=80, to=240, increment=5, textvariable=self.bw_threshold_var, width=8).grid(row=2, column=3, sticky=tk.W)
+
+        ttk.Label(
+            watermark_box,
+            text="이미 워터마크가 본문 이미지와 합쳐진 PDF용입니다. 검은 악보/흰 배경 문서에 적합하며, 연한 회색 요소는 사라질 수 있습니다. 기본값 180 권장.",
+        ).grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
 
         self._sync_quality_state()
 
@@ -279,6 +366,7 @@ class App(tk.Tk):
         self._log("PDF.js에서 불안정한 PDF를 페이지 이미지 기반 PDF로 정규화합니다.")
         self._log("권장 시작값: DPI 200, PNG, workers 6. 파일 크기가 크면 JPEG 95를 테스트하세요.")
         self._log("워터마크 제거 옵션은 권한이 있는 PDF에서만 사용하세요.")
+        self._log("이미지에 합쳐진 워터마크는 '흑백 임계값 변환' 옵션을 사용하세요. 기본 임계값 180.")
 
     def _sync_quality_state(self) -> None:
         if self.format_var.get() == "jpeg":
@@ -313,8 +401,9 @@ class App(tk.Tk):
             dpi = int(self.dpi_var.get())
             jpeg_quality = int(self.quality_var.get())
             workers = int(self.workers_var.get())
+            bw_threshold = int(self.bw_threshold_var.get())
         except Exception:
-            messagebox.showerror("입력 오류", "DPI, JPEG 품질, 동시 작업 수는 숫자여야 합니다.")
+            messagebox.showerror("입력 오류", "DPI, JPEG 품질, 동시 작업 수, 임계값은 숫자여야 합니다.")
             return None
 
         if dpi < 120 or dpi > 400:
@@ -325,6 +414,9 @@ class App(tk.Tk):
             return None
         if workers < 1:
             messagebox.showerror("입력 오류", "동시 작업 수는 1 이상이어야 합니다.")
+            return None
+        if bw_threshold < 80 or bw_threshold > 240:
+            messagebox.showerror("입력 오류", "흑백 임계값은 80~240 범위로 지정하세요.")
             return None
 
         return ConvertOptions(
@@ -337,6 +429,8 @@ class App(tk.Tk):
             skip_existing=bool(self.skip_var.get()),
             suffix=self.suffix_var.get(),
             remove_watermark_artifacts=bool(self.remove_watermark_var.get()),
+            raster_watermark_cleanup=bool(self.raster_cleanup_var.get()),
+            bw_threshold=bw_threshold,
         )
 
     def start(self) -> None:
@@ -352,10 +446,10 @@ class App(tk.Tk):
             messagebox.showinfo("PDF 없음", "선택한 폴더에 PDF 파일이 없습니다.")
             return
 
-        if options.remove_watermark_artifacts:
+        if options.remove_watermark_artifacts or options.raster_watermark_cleanup:
             ok = messagebox.askyesno(
                 "권한 확인",
-                "워터마크 Artifact 제거 옵션이 켜져 있습니다.\n\n이 옵션은 권한이 있는 PDF에서만 사용해야 합니다. 계속할까요?",
+                "워터마크 제거 관련 옵션이 켜져 있습니다.\n\n이 옵션은 권한이 있는 PDF에서만 사용해야 합니다. 계속할까요?",
             )
             if not ok:
                 return
@@ -365,6 +459,7 @@ class App(tk.Tk):
         self.done_count = 0
         self.counts = {"ok": 0, "skip": 0, "fail": 0, "cancel": 0}
         self.watermark_blocks_total = 0
+        self.raster_pages_cleaned_total = 0
         self.progress.configure(maximum=self.total_count, value=0)
         self.start_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(state=tk.NORMAL)
@@ -375,7 +470,8 @@ class App(tk.Tk):
         self._log(f"출력: {options.output_dir}")
         self._log(
             f"옵션: DPI={options.dpi}, format={options.image_format}, quality={options.jpeg_quality}, "
-            f"workers={options.workers}, remove_watermark_artifacts={options.remove_watermark_artifacts}"
+            f"workers={options.workers}, remove_watermark_artifacts={options.remove_watermark_artifacts}, "
+            f"raster_watermark_cleanup={options.raster_watermark_cleanup}, bw_threshold={options.bw_threshold}"
         )
 
         self.worker_thread = threading.Thread(
@@ -396,7 +492,7 @@ class App(tk.Tk):
         log_path = options.output_dir / "_conversion-log.tsv"
 
         with log_path.open("w", encoding="utf-8") as log_file:
-            log_file.write("status\tsource\toutput\telapsed_sec\twatermark_blocks_removed\tmessage\n")
+            log_file.write("status\tsource\toutput\telapsed_sec\twatermark_blocks_removed\traster_pages_cleaned\tmessage\n")
             log_file.flush()
 
             try:
@@ -413,7 +509,7 @@ class App(tk.Tk):
                         safe_msg = result.message.replace("\r", " ").replace("\n", " | ")
                         log_file.write(
                             f"{result.status}\t{result.source}\t{result.output}\t{result.elapsed_sec:.2f}\t"
-                            f"{result.watermark_blocks_removed}\t{safe_msg}\n"
+                            f"{result.watermark_blocks_removed}\t{result.raster_pages_cleaned}\t{safe_msg}\n"
                         )
                         log_file.flush()
                         self.event_queue.put(("result", result))
@@ -443,26 +539,29 @@ class App(tk.Tk):
         self.done_count += 1
         self.counts[result.status] = self.counts.get(result.status, 0) + 1
         self.watermark_blocks_total += result.watermark_blocks_removed
+        self.raster_pages_cleaned_total += result.raster_pages_cleaned
         self.progress.configure(value=self.done_count)
 
         name = Path(result.source).name
-        wm_info = ""
+        extra_info = ""
         if result.watermark_blocks_removed:
-            wm_info = f" | watermark blocks removed={result.watermark_blocks_removed}"
+            extra_info += f" | watermark blocks removed={result.watermark_blocks_removed}"
+        if result.raster_pages_cleaned:
+            extra_info += f" | raster pages cleaned={result.raster_pages_cleaned}"
 
         if result.status == "ok":
-            self._log(f"[OK] {name} -> {result.output} ({result.elapsed_sec:.1f}s){wm_info}")
+            self._log(f"[OK] {name} -> {result.output} ({result.elapsed_sec:.1f}s){extra_info}")
         elif result.status == "skip":
             self._log(f"[SKIP] {name}")
         elif result.status == "cancel":
-            self._log(f"[CANCEL] {name}{wm_info}")
+            self._log(f"[CANCEL] {name}{extra_info}")
         else:
-            self._log(f"[FAIL] {name}{wm_info}\n{result.message}")
+            self._log(f"[FAIL] {name}{extra_info}\n{result.message}")
 
         self.status_var.set(
             f"{self.done_count} / {self.total_count} | "
             f"성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, 실패 {self.counts.get('fail', 0)}, "
-            f"워터마크 블록 제거 {self.watermark_blocks_total}"
+            f"Artifact 제거 {self.watermark_blocks_total}, 이미지 정리 {self.raster_pages_cleaned_total}p"
         )
 
     def _finish(self, log_path: str) -> None:
@@ -471,7 +570,7 @@ class App(tk.Tk):
         self.status_var.set(
             f"완료 | 성공 {self.counts.get('ok', 0)}, 건너뜀 {self.counts.get('skip', 0)}, "
             f"실패 {self.counts.get('fail', 0)}, 취소 {self.counts.get('cancel', 0)}, "
-            f"워터마크 블록 제거 {self.watermark_blocks_total}"
+            f"Artifact 제거 {self.watermark_blocks_total}, 이미지 정리 {self.raster_pages_cleaned_total}p"
         )
         self._log(f"로그 파일: {log_path}")
         self._log("완료")

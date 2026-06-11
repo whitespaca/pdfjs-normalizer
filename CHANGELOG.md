@@ -1,12 +1,17 @@
 # Changelog
 
-## 1.1.0
+## v1.2.0
 
-- Add authorized-document-only option to remove explicit PDF watermark Artifact blocks before rasterizing.
-- Add watermark removal count to conversion log.
-- Default worker count changed to up to 6 for better use of modern desktop CPUs.
+- Added raster watermark cleanup mode for watermark already baked into the page image.
+- Added black/white threshold option. Default threshold: 180.
+- Added `Pillow` dependency.
+- Conversion log now includes `raster_pages_cleaned`.
 
-## 1.0.0
+## v1.1.0
 
-- Initial PDF.js compatibility rasterization GUI.
-- GitHub Release workflow for Windows EXE.
+- Added authorized explicit PDF watermark artifact removal option.
+- Added conversion-log watermark block count.
+
+## v1.0.0
+
+- Initial GUI converter.
